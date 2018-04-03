@@ -1,0 +1,164 @@
+#!/usr/bin/python
+
+import urllib2
+import os
+import sys
+import argparse
+import shutil
+import logging
+import OpenSSL
+import subprocess
+import re
+
+class LoggingFilter(logging.Filter):
+	def __init__(self, level):
+		self.level = level
+
+	def filter(self, record):
+		return record.levelno == self.level
+LOG = logging.getLogger('manage-certs')
+FRMTR = logging.Formatter(fmt='[%(asctime)s] %(name)s\t(%(levelname)s)\t %(message)s')
+STDERR_H = logging.StreamHandler(sys.stderr)
+STDERR_H.setFormatter(FRMTR)
+STDERR_H.addFilter(LoggingFilter(logging.ERROR))
+STDOUT_H = logging.StreamHandler(sys.stdout)
+STDOUT_H.addFilter(LoggingFilter(logging.INFO))
+STDOUT_H.setFormatter(FRMTR)
+LOG.addHandler(STDERR_H)
+LOG.addHandler(STDOUT_H)
+
+
+def fetch_crls(cadir, dest, uri, local, localdir):
+	try:
+		cas = [ f for f in os.listdir(cadir) if f.endswith('.pem') ]
+		for ca in cas:
+			ca_name = ca[:-4]
+			if ca_name == 'ca-chain':
+				continue
+			if not local:
+				crl_from = '{0}/{1}'.format(uri, ca_name)
+				crl_to = os.path.join(dest, '{0}.crl'.format(ca_name))
+				try:
+					url_obj = urllib2.urlopen(crl_from)
+					if url_obj.code != 200:
+						LOG.error('%s: Received Non-200 response for "%s" (%s)', ca_name, crl_from, url_obj.code)
+						continue
+					LOG.info('%s: Received CRL from %s (%s)', ca_name, crl_from, url_obj.code)
+					crl_data = url_obj.read()
+					OpenSSL.crypto.load_crl(OpenSSL.crypto.FILETYPE_PEM, crl_data)
+					LOG.info('%s: CRL appears to be valid.', ca_name)
+					open(crl_to, 'w+').write(crl_data)
+					LOG.info('%s: Wrote out CRL to %s', ca_name, crl_to)
+				except OpenSSL.crypto.Error, e:
+					LOG.error('%s: Invalid CRL Received (%s)', ca_name, e)
+				except urllib2.URLError, e:
+					LOG.error('%s: Cannot retrieve crl "%s" (%s)', ca_name, crl_from, e)
+			else:
+				try:
+					copy_from = os.path.join(cadir, ca)
+					copy_to = dest
+					LOG.info('%s: Fetch-CRL (LOCAL) Copying %s to %s', ca_name, copy_from, copy_to) 
+					shutils.copy2(copy_from, copy_to)
+				except IOError, e:
+					LOG.error('%s: Error copying file. (%s)', ca_name, e)
+	except OSError, e:
+		LOG.error('cadir "%s" does not seem to exist', cadir)
+		
+def rehash(dirs):
+	is_cert = re.compile(r'\.(crt|pem|crl)$')
+	is_hash = re.compile(r'[\da-f]+\.r{0,1}\d+$')
+	LOG.info('Starting Rehash')
+	for directory in dirs:
+		certs = list()
+		hashes = list()
+		new_hashes = dict()
+		unlinked = list()
+		LOG.info('%s: Collectig Certs and CRLs.', directory)
+		for f in os.listdir(directory):
+			if is_cert.search(f):
+				certs.append(f)
+			elif is_hash.search(f):
+				hashes.append(f)
+		LOG.info('%s: Certs Found %s', directory, certs)
+		LOG.info('%s: Hash Links Found %s', directory, hashes)
+		for h in hashes:
+			path = os.path.join(directory, h)
+			try:
+				os.unlink(os.path.join(directory, h))
+				unlinked.append(h)
+			except OSError, e:
+				LOG.error('%s: Unable to unlink hash %s (%s)', directory, path, e)
+		LOG.info('%s: Unlinked Hashes %s', directory, unlinked)
+		for c in certs:
+			path = os.path.join(directory, c) 
+			newhash = None
+			is_crl = ''
+			if c.endswith('.crl'):
+				try:
+					p =  subprocess.Popen(['/usr/bin/openssl',  'crl',  '-hash',  '-noout',  '-in',  path ],
+								stdout=subprocess.PIPE,
+								stderr=subprocess.PIPE)
+					out, err = p.communicate()
+					newhash = out.split()[0]
+				except:
+					try:
+						p = subprocess.Popen(['/usr/bin/openssl',  'crl',  '-hash',  '-noout',  '-in',  path, '-inform', 'der' ],
+								stdout=subprocess.PIPE,
+								stderr=subprocess.PIPE)
+						out, err = p.communicate()
+						newhash = out.split()[0]
+					except:
+						LOG.error('%s: Unable to determine hash for %s, skipping', directory, c)
+						continue
+						
+				is_crl = 'r'
+				LOG.info('%s: Fingerprint for %s is %s', directory, c, newhash)
+			if c.endswith(('.pem', '.crt')):
+				try:
+					p = subprocess.Popen(['/usr/bin/openssl', 'x509', '-subject_hash', '-fingerprint', '-noout', '-in', path],
+							     stdout=subprocess.PIPE,
+							     stderr=subprocess.PIPE)
+					out, err = p.communicate()
+					newhash = out.split()[0]
+				except:
+					LOG.error('%s: Unable to determine hash for %s, skipping', directory, c)
+
+			if newhash:
+				suffix = 0
+				while (os.path.exists(os.path.join(directory, '{0}.{1}{2}'.format(newhash, is_crl, suffix)))):
+					suffix += 1
+				os.symlink(path, os.path.join(directory, '{0}.{1}{2}'.format(newhash, is_crl, suffix)))
+				LOG.info('%s: Linked %s to %s', directory, '{0}.{1}{2}'.format(newhash, is_crl, suffix), c)
+			
+					
+				
+			
+
+def main():
+	parser = argparse.ArgumentParser(description='Manage CRLs and Certificate Hashing')
+	parser.add_argument('--action', default='fetch', choices=['fetch', 'hash'])
+	parser.add_argument('--verbose', '-v', default=False, action='store_true', help='Print more information')
+	fetch_group = parser.add_argument_group('Fetch CRLs', 'Options for Fetching CRLs')
+	fetch_group.add_argument('--cadir', default='/var/lib/pki/cas', help='Directory the CAs reside in')
+	fetch_group.add_argument('--crldir', default='/var/lib/pki/crls', help='Directory the CRLs reside in')
+	fetch_group.add_argument('--local', default=False, action='store_true', help='CRLs are local, do not use HTTP')
+	fetch_group.add_argument('--localdir', default='/var/www/crl', help='Local Directory CRLs reside in. ONLY USED IF --local IS SPECIFIED')
+	fetch_group.add_argument('--uri', default='http://pki.mc.metacloud.com/crl', help='Base URI for collecting CRLs from')
+	hash_group = parser.add_argument_group('Hashing', 'Options for Hashing CRLs and Certs')
+	hash_group.add_argument('--directory', default=[], action='append', help='Directorys to perform certificate and/or CRL hashing on.  Can be specified multiple times.')
+
+	args = parser.parse_args()
+
+	if args.verbose:
+		LOG.setLevel(logging.INFO)
+	else:
+		LOG.setLevel(logging.WARN)
+
+	if args.action == 'fetch':
+		fetch_crls(args.cadir, args.crldir, args.uri, args.local, args.localdir)
+		rehash([args.crldir])
+	elif args.action == 'hash':
+			rehash(args.directory)
+
+if __name__ == '__main__':
+	main()
